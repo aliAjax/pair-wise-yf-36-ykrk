@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
+from .repository import utcnow
 from .rules import RuleEngine
 
 
@@ -10,12 +11,18 @@ class DomainService:
         self.repository = repository
         self.rules = rules or RuleEngine()
         self.audit = AuditTrail(repository)
+        # 模拟外单位网络：断网时回执先挂起，等网络恢复再重试
+        self.network_ok = True
 
     def _lookup(self, kind, field, value):
         return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
 
     def health(self):
         return {"status": "ok" if self.repository.ping() else "error"}
+
+    def set_network(self, ok):
+        self.network_ok = bool(ok)
+        return {"network_ok": self.network_ok}
 
     def create(self, actor, kind, data, idempotency_key=None):
         kind = self.rules.normalize_kind(kind)
@@ -55,6 +62,97 @@ class DomainService:
             entity["status"],
             updated["status"],
             {"patch": patch},
+        )
+        # 撤回审批通过后：冻结还没回执的发放单并发起召回
+        if entity["kind"] == "withdrawal" and action == "approve":
+            self._freeze_pending_distributions(actor, entity)
+        return updated
+
+    def _freeze_pending_distributions(self, actor, withdrawal):
+        participant_id = withdrawal["data"].get("participant_id")
+        if not participant_id:
+            return
+        distributions = self._lookup("distribution", "participant_id", participant_id)
+        for dist in distributions:
+            if dist["status"] != "pending":
+                continue
+            try:
+                self.transition(
+                    actor,
+                    dist["id"],
+                    "freeze",
+                    {"reason": "withdrawal approved"},
+                    expected_version=dist["version"],
+                )
+            except ConflictError:
+                # 已被回执或被其他操作并发处理，跳过
+                continue
+
+    def submit_receipt(self, actor, data):
+        kind = "receipt"
+        payload = dict(data or {})
+        self.rules.validate_create(actor, kind, payload, self._lookup)
+        entity_id = str(payload.pop("id", "") or uuid4())
+        if self.repository.get_entity(entity_id):
+            raise ConflictError("entity already exists: " + entity_id)
+        # 回执先以 pending（挂起）状态落库
+        receipt = self.repository.create_entity(entity_id, kind, "pending", payload, actor.user_id)
+        self.audit.record(entity_id, actor, "create", None, "pending", {"kind": kind})
+        if self.network_ok:
+            receipt = self._reconcile_receipt(actor, receipt)
+        return receipt
+
+    def retry_receipt(self, actor, receipt_id):
+        receipt = self.repository.get_entity(receipt_id)
+        if not receipt:
+            raise NotFoundError("receipt not found: " + receipt_id)
+        if receipt["status"] != "pending":
+            return receipt
+        if not self.network_ok:
+            return receipt
+        return self._reconcile_receipt(actor, receipt)
+
+    def _reconcile_receipt(self, actor, receipt):
+        distribution_id = receipt["data"].get("distribution_id")
+        distributions = self._lookup("distribution", "id", distribution_id)
+        distribution = distributions[0] if distributions else None
+        if not distribution:
+            return self._set_receipt_status(
+                actor, receipt, "conflict", {"reason": "distribution not found"}
+            )
+        if distribution["status"] == "receipted":
+            return self._set_receipt_status(
+                actor, receipt, "reconciled", {"idempotent": True}
+            )
+        if distribution["status"] != "pending":
+            return self._set_receipt_status(
+                actor,
+                receipt,
+                "conflict",
+                {"reason": "distribution status is " + distribution["status"]},
+            )
+        # 发放单处于待回执：用乐观锁把它翻成已回执
+        # 若撤回冻结并发提交，版本号会冲突，回执失败（只能有一边成功）
+        try:
+            self.transition(
+                actor,
+                distribution["id"],
+                "receipt",
+                {"received_at": receipt["data"].get("received_at") or utcnow()},
+                expected_version=distribution["version"],
+            )
+        except ConflictError:
+            return self._set_receipt_status(
+                actor, receipt, "conflict", {"reason": "concurrent freeze won"}
+            )
+        return self._set_receipt_status(actor, receipt, "reconciled", {})
+
+    def _set_receipt_status(self, actor, receipt, status, detail):
+        updated = self.repository.update_entity(
+            receipt["id"], receipt["version"], status, receipt["data"]
+        )
+        self.audit.record(
+            receipt["id"], actor, "reconcile", receipt["status"], status, detail
         )
         return updated
 

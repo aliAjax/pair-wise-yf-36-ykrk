@@ -40,18 +40,129 @@ def _validate_withdrawal_approve(actor, entity, data, lookup):
     return {"approved_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'participant': _validate_participant, 'consent': _validate_consent}
-CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+def _validate_distribution_create(actor, data, lookup):
+    sample = _find_one(lookup, "sample", "id", data.get("sample_id"))
+    if not sample:
+        raise ValidationError("distribution requires a sample")
+    if sample["status"] != "stored":
+        raise ValidationError("sample must be stored before distribution")
+    if not data.get("recipient"):
+        raise ValidationError("recipient (接收机构) is required")
+    if not data.get("purpose"):
+        raise ValidationError("purpose (检测用途) is required")
+    # 反规范化 participant_id，便于撤回时按参与者批量冻结
+    data["participant_id"] = sample["data"].get("participant_id")
+    return {"participant_id": data["participant_id"]}
+
+
+def _validate_receipt_create(actor, data, lookup):
+    distribution = _find_one(lookup, "distribution", "id", data.get("distribution_id"))
+    if not distribution:
+        raise ValidationError("receipt requires a distribution order")
+
+
+CUSTOM_CREATE = {
+    'participant': _validate_participant,
+    'consent': _validate_consent,
+    'distribution': _validate_distribution_create,
+    'receipt': _validate_receipt_create,
+}
+CUSTOM_TRANSITIONS = {
+    ('sample', 'store'): _validate_sample_store,
+    ('withdrawal', 'approve'): _validate_withdrawal_approve,
+}
 
 
 class RuleEngine:
-    ALIASES = {'participants': 'participant', 'consents': 'consent', 'samples': 'sample', 'withdrawals': 'withdrawal'}
-    INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
-    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
-    CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
-    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
-    CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
-    ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
+    ALIASES = {
+        'participants': 'participant',
+        'consents': 'consent',
+        'samples': 'sample',
+        'withdrawals': 'withdrawal',
+        'distributions': 'distribution',
+        'receipts': 'receipt',
+    }
+    INITIAL_STATUS = {
+        'participant': 'registered',
+        'consent': 'draft',
+        'sample': 'collected',
+        'withdrawal': 'requested',
+        'distribution': 'pending',
+        'receipt': 'pending',
+    }
+    TRANSITIONS = {
+        'participant': {'close_participant': (('registered',), 'closed')},
+        'consent': {
+            'activate': (('draft',), 'active'),
+            'supersede': (('active',), 'superseded'),
+            'withdraw': (('active',), 'withdrawn'),
+        },
+        'sample': {
+            'store': (('collected',), 'stored'),
+            'loan': (('stored',), 'on_loan'),
+            'return': (('on_loan',), 'stored'),
+            'anonymize': (('stored',), 'anonymized'),
+            'destroy': (('stored',), 'destroyed'),
+        },
+        'withdrawal': {
+            'approve': (('requested',), 'approved'),
+            'execute': (('approved',), 'executed'),
+        },
+        'distribution': {
+            'receipt': (('pending',), 'receipted'),
+            'freeze': (('pending',), 'frozen'),
+            'recall': (('frozen',), 'recalled'),
+            'return': (('receipted', 'recalled'), 'returned'),
+            'destroy': (('receipted', 'recalled'), 'destroyed'),
+        },
+        'receipt': {},
+    }
+    CREATE_REQUIRED = {
+        'participant': ('name',),
+        'consent': ('participant_id', 'scope'),
+        'sample': ('participant_id', 'sample_code', 'collected_at'),
+        'withdrawal': ('participant_id', 'requested_at'),
+        'distribution': ('sample_id', 'recipient', 'purpose'),
+        'receipt': ('distribution_id',),
+    }
+    ACTION_REQUIRED = {
+        ('consent', 'activate'): ('scope', 'version', 'expires_at'),
+        ('consent', 'supersede'): ('reason',),
+        ('consent', 'withdraw'): ('reason',),
+        ('sample', 'store'): ('freezer', 'position', 'consent_id'),
+        ('sample', 'loan'): ('recipient', 'purpose', 'due_at'),
+        ('sample', 'anonymize'): ('reason',),
+        ('sample', 'destroy'): ('reason',),
+        ('withdrawal', 'approve'): ('reason', 'sample_ids'),
+        ('withdrawal', 'execute'): ('executed_at',),
+        ('distribution', 'receipt'): ('received_at',),
+        ('distribution', 'return'): ('returned_at',),
+        ('distribution', 'destroy'): ('destroyed_at', 'reason'),
+    }
+    CREATE_ROLES = {
+        'participant': ('admin', 'biobank'),
+        'consent': ('admin', 'committee'),
+        'sample': ('admin', 'biobank'),
+        'withdrawal': ('admin', 'biobank'),
+        'distribution': ('admin', 'biobank'),
+        'receipt': ('admin', 'biobank'),
+    }
+    ROLE_ACTIONS = {
+        'close_participant': ('admin', 'biobank'),
+        'activate': ('admin', 'committee'),
+        'supersede': ('admin', 'committee'),
+        'withdraw': ('admin', 'committee'),
+        'store': ('admin', 'biobank'),
+        'loan': ('admin', 'biobank'),
+        'return': ('admin', 'biobank'),
+        'anonymize': ('admin', 'biobank'),
+        'destroy': ('admin', 'biobank'),
+        'approve': ('admin', 'committee'),
+        'execute': ('admin', 'biobank'),
+        'receipt': ('admin', 'biobank'),
+        'freeze': ('admin', 'biobank'),
+        'recall': ('admin', 'biobank'),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

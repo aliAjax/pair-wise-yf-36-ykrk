@@ -138,6 +138,14 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if len(parts) == 2 and parts[0] == "api" and parts[1] == "network":
+                    body = self._body()
+                    return self._send(200, service.set_network(body.get("ok", True)))
+                if len(parts) == 4 and parts[0] == "api" and parts[1] == "receipts" and parts[3] == "retry":
+                    return self._send(200, service.retry_receipt(actor, parts[2]))
+                if len(parts) == 2 and parts[0] == "api" and parts[1] == "receipts":
+                    body = self._body()
+                    return self._send(201, service.submit_receipt(actor, body))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")
