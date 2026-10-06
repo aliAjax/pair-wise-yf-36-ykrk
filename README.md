@@ -25,6 +25,27 @@ python3 app.py --db ./data.db --port 8302
 ## 核心对象
 
 - `participant`：参与者；`consent`：同意版本；`sample`：样本；`withdrawal`：撤回申请。
+- `dispatch`：外发发放单。出库时登记接收机构（`recipient_org`）、检测用途（`purpose`）和样本（`sample_ids`），
+  样本同步转为 `on_loan`，发放单停留在 `pending_receipt` 等待回执。
+- `receipt`：接收机构回执。对账成功为 `reconciled`；断网或发放单已被冻结时为 `suspended`，网络恢复后可重放。
+
+发放单状态机：
+
+- `pending_receipt` → 回执对账成功 → `acknowledged`（已出检测结果）。
+- 撤回同意批准时级联：未回执的发放单 `freeze` → `frozen`（记录冻结前状态）→ 召回 `recall_complete` → `recalled`，样本回到在库；
+  已确认的发放单冻结后只能 `return`（实物退回，样本回库）或 `destroy`（实物销毁，样本销毁）。
+- 回执对账与本地冻结在同一 SQLite 写事务层面互斥（`BEGIN IMMEDIATE` + 行版本校验），并发时只有一边成功，
+  失败方整笔回滚；回执落败时登记为 `suspended`，不会两边都改。
+
+## 外发与回执接口
+
+- `POST /api/dispatches`：出库创建发放单（admin/biobank），必填 `recipient_org`、`purpose`、`sample_ids`、`issued_at`。
+- `POST /api/receipts`：接收机构提交回执（role=`recipient`），必填 `dispatch_id`、`received_at`、`result_status`；
+  可带 `received_sample_ids` 与本地发放单对账。
+- `GET /api/dispatches?status=frozen`：按状态查看发放单（页面同样支持）。
+- `GET /api/network` / `POST /api/network`（admin，`{"online": false}`）：查看/切换回执通道网络状态。
+- `POST /api/receipts/retry`（admin/biobank）：网络恢复后重放全部挂起回执；
+  发放单已冻结的回执保持 `suspended` 并记录原因，等待退回/销毁处置。
 
 ## 主要接口
 

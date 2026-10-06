@@ -85,6 +85,8 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "network"]:
+                    return self._send(200, service.network_status())
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -107,6 +109,20 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "receipts", "retry"]:
+                    if actor.role not in ("admin", "biobank"):
+                        raise PermissionDenied("only biobank staff can replay receipts")
+                    return self._send(200, service.retry_suspended_receipts(actor))
+                if parts == ["api", "network"]:
+                    if actor.role != "admin":
+                        raise PermissionDenied("only admin can change network mode")
+                    body = self._body()
+                    return self._send(200, service.set_network(actor, body.get("online", True)))
+                if parts == ["api", "receipts"]:
+                    body = self._body()
+                    idem = self.headers.get("Idempotency-Key")
+                    receipt = service.submit_receipt(actor, body, idem)
+                    return self._send(201, receipt)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

@@ -33,6 +33,11 @@ class Role(str, Enum):
     researcher = "researcher"
     biobank = "biobank"
     committee = "committee"
+    recipient = "recipient"
+
+
+class OfflineError(DomainError):
+    """Network is offline; the request has been queued for retry."""
 
 
 @dataclass

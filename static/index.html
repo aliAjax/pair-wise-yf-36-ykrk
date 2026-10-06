@@ -3,32 +3,135 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>生物样本库知情同意与撤回</title>
+  <title>生物样本库 · 外发检测与撤回</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
-    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    main { max-width: 980px; margin: auto; }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.1rem; margin-top: 2rem; }
+    table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+    th, td { border: 1px solid #e5e7eb; padding: .45rem .6rem; text-align: left; }
+    th { background: #f9fafb; }
+    .status { font-weight: 600; }
+    .pending_receipt { color: #b45309; }
+    .acknowledged { color: #1d4ed8; }
+    .frozen { color: #be123c; }
+    .recalled, .returned { color: #047857; }
+    .destroyed { color: #6b7280; }
+    .suspended { color: #be123c; }
+    .reconciled { color: #047857; }
+    select, button { padding: .4rem .6rem; margin-right: .5rem; cursor: pointer; }
+    .muted { color: #6b7280; font-size: .85rem; }
+    code { background: #f3f4f6; padding: .1rem .3rem; border-radius: 4px; }
   </style>
 </head>
 <body>
 <main>
-  <h1>生物样本库知情同意与撤回</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+  <h1>生物样本库 · 外发检测与同意撤回</h1>
+  <p class="muted">
+    出库后发放单停留在 <code>pending_receipt</code>；接收机构回执对账成功后变为
+    <code>acknowledged</code>；撤回同意会冻结未回执的发放单并召回，已出结果的退回或销毁。
+  </p>
+
+  <h2>外部网络（回执通道）</h2>
+  <p>
+    当前：<strong id="net">…</strong>
+    <button onclick="setNetwork(true)">设为在线</button>
+    <button onclick="setNetwork(false)">模拟断网</button>
+    <button onclick="retryReceipts()">恢复后重放挂起回执</button>
+  </p>
+  <pre id="retryResult" class="muted"></pre>
+
+  <h2>发放单（按状态查看）</h2>
+  <p>
+    <select id="dispatchStatus" onchange="loadDispatches()">
+      <option value="">全部状态</option>
+      <option value="pending_receipt">待回执 pending_receipt</option>
+      <option value="acknowledged">已确认 acknowledged</option>
+      <option value="frozen">已冻结 frozen</option>
+      <option value="recalled">已召回 recalled</option>
+      <option value="returned">已退回 returned</option>
+      <option value="destroyed">已销毁 destroyed</option>
+    </select>
+    <button onclick="loadDispatches()">刷新</button>
+  </p>
+  <table>
+    <thead>
+      <tr><th>发放单</th><th>状态</th><th>接收机构</th><th>检测用途</th><th>样本</th><th>冻结来源</th></tr>
+    </thead>
+    <tbody id="dispatchRows"></tbody>
+  </table>
+
+  <h2>回执</h2>
+  <table>
+    <thead>
+      <tr><th>回执</th><th>状态</th><th>发放单</th><th>结果</th><th>挂起原因</th></tr>
+    </thead>
+    <tbody id="receiptRows"></tbody>
+  </table>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    headers: {"Content-Type": "application/json", "X-User-Id": "web", "X-Role": "admin", ...(options.headers || {})},
+    ...options,
+  });
+  return response.json();
 }
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+}
+
+async function loadNetwork() {
+  const status = await api("/api/network");
+  document.getElementById("net").textContent = status.online ? "在线" : "断网（回执将挂起）";
+}
+
+async function setNetwork(online) {
+  await api("/api/network", {method: "POST", body: JSON.stringify({online})});
+  loadNetwork();
+}
+
+async function retryReceipts() {
+  const result = await api("/api/receipts/retry", {method: "POST", body: "{}"});
+  document.getElementById("retryResult").textContent = JSON.stringify(result, null, 2);
+  loadAll();
+}
+
+async function loadDispatches() {
+  const status = document.getElementById("dispatchStatus").value;
+  const items = (await api("/api/dispatches" + (status ? "?status=" + status : ""))).items || [];
+  document.getElementById("dispatchRows").innerHTML = items.map(d => `
+    <tr>
+      <td>${esc(d.id.slice(0, 8))}</td>
+      <td class="status ${esc(d.status)}">${esc(d.status)}</td>
+      <td>${esc(d.data.recipient_org)}</td>
+      <td>${esc(d.data.purpose)}</td>
+      <td>${(d.data.sample_ids || []).map(s => esc(s.slice(0, 8))).join(", ")}</td>
+      <td>${esc(d.data.frozen_from || "")}</td>
+    </tr>`).join("") || `<tr><td colspan="6" class="muted">无发放单</td></tr>`;
+}
+
+async function loadReceipts() {
+  const items = (await api("/api/receipts")).items || [];
+  document.getElementById("receiptRows").innerHTML = items.map(r => `
+    <tr>
+      <td>${esc(r.id.slice(0, 8))}</td>
+      <td class="status ${esc(r.status)}">${esc(r.status)}</td>
+      <td>${esc((r.data.dispatch_id || "").slice(0, 8))}</td>
+      <td>${esc(r.data.result_status)}</td>
+      <td>${esc(r.data.suspension_note || "")}</td>
+    </tr>`).join("") || `<tr><td colspan="5" class="muted">无回执</td></tr>`;
+}
+
+function loadAll() {
+  loadNetwork();
+  loadDispatches();
+  loadReceipts();
+}
+loadAll();
+setInterval(loadAll, 5000);
 </script>
 </body>
 </html>
